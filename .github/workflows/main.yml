@@ -36,7 +36,7 @@ jobs:
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install playwright asyncio pyperclip yt-dlp
+        pip install playwright asyncio yt-dlp
         playwright install chromium
         playwright install-deps
         
@@ -151,6 +151,24 @@ jobs:
           fi
         }
         
+        # Função para capturar clipboard
+        get_clipboard_content() {
+          # Tentar diferentes métodos para pegar o clipboard
+          local content=""
+          
+          # Método 1: xclip
+          if command -v xclip >/dev/null 2>&1; then
+            content=$(timeout 5 xclip -selection clipboard -o 2>/dev/null || echo "")
+          fi
+          
+          # Método 2: xsel como fallback
+          if [ -z "$content" ] && command -v xsel >/dev/null 2>&1; then
+            content=$(timeout 5 xsel --clipboard --output 2>/dev/null || echo "")
+          fi
+          
+          echo "$content"
+        }
+        
         email="${{ steps.setup_accounts.outputs.email }}"
         account_name="${{ steps.setup_accounts.outputs.account_name }}"
         start_seg=${{ steps.segments.outputs.start }}
@@ -208,25 +226,65 @@ jobs:
           
           echo "Segmento $segment baixado: $(ls -lh $segment_file)"
           
+          # Limpar clipboard antes de executar
+          echo "" | xclip -selection clipboard 2>/dev/null || true
+          echo "" | xsel --clipboard --input 2>/dev/null || true
+          
           # Executar análise com IA
           echo "Analisando segmento $segment com IA..."
           
-          # Criar arquivo temporário para esta resposta
-          temp_output="outputs/temp_${account_name}_${segment}.txt"
-          
-          if python qwen_improved.py -email "$email" -video "$segment_file" -output "$temp_output" -segment $segment; then
-            echo "Análise do segmento $segment concluída com sucesso"
+          # Executar o script original do qwen.py
+          if python qwen.py -email "$email" -video "$segment_file"; then
+            echo "Script do qwen.py executado com sucesso para segmento $segment"
             
-            # Adicionar ao arquivo principal de forma thread-safe
-            if [ -f "$temp_output" ]; then
-              cat "$temp_output" >> $output_file
-              rm "$temp_output"
+            # Aguardar um pouco para garantir que o clipboard foi preenchido
+            sleep 3
+            
+            # Tentar capturar o conteúdo do clipboard
+            response_text=$(get_clipboard_content)
+            
+            if [ -n "$response_text" ] && [ "$response_text" != "" ]; then
+              echo "Resposta capturada do clipboard para segmento $segment"
+              
+              # Adicionar ao arquivo principal
+              echo "=== SEGMENTO $(printf "%04d" $segment) ===" >> $output_file
+              echo "Arquivo: $(basename $segment_file)" >> $output_file
+              echo "Análise: $response_text" >> $output_file
+              echo "==================================================" >> $output_file
+              echo "" >> $output_file
+              
+              echo "Análise do segmento $segment salva com sucesso"
+            else
+              echo "AVISO: Clipboard vazio para segmento $segment"
+              
+              # Tentar esperar mais um pouco e tentar novamente
+              echo "Tentando capturar clipboard novamente..."
+              sleep 5
+              response_text=$(get_clipboard_content)
+              
+              if [ -n "$response_text" ] && [ "$response_text" != "" ]; then
+                echo "Resposta capturada na segunda tentativa para segmento $segment"
+                
+                echo "=== SEGMENTO $(printf "%04d" $segment) ===" >> $output_file
+                echo "Arquivo: $(basename $segment_file)" >> $output_file
+                echo "Análise: $response_text" >> $output_file
+                echo "==================================================" >> $output_file
+                echo "" >> $output_file
+              else
+                echo "ERRO: Não foi possível capturar a resposta para segmento $segment"
+                
+                echo "=== SEGMENTO $(printf "%04d" $segment) ===" >> $output_file
+                echo "Arquivo: $(basename $segment_file)" >> $output_file
+                echo "Análise: ERRO - Falha na captura da resposta (clipboard vazio)" >> $output_file
+                echo "==================================================" >> $output_file
+                echo "" >> $output_file
+              fi
             fi
           else
-            echo "ERRO: Falha na análise do segmento $segment"
+            echo "ERRO: Falha na execução do qwen.py para segmento $segment"
             echo "=== SEGMENTO $(printf "%04d" $segment) ===" >> $output_file
             echo "Arquivo: $(basename $segment_file)" >> $output_file
-            echo "Análise: ERRO - Falha na análise automática" >> $output_file
+            echo "Análise: ERRO - Falha na execução do script de análise" >> $output_file
             echo "==================================================" >> $output_file
             echo "" >> $output_file
           fi
@@ -237,8 +295,8 @@ jobs:
           echo "Segmento $segment processado e removido"
           echo "---"
           
-          # Pequena pausa entre segmentos
-          sleep 5
+          # Pausa entre segmentos para evitar sobrecarga
+          sleep 10
         done
         
         echo "=== Processamento da conta $account_name concluído ==="
