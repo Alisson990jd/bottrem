@@ -1,0 +1,29 @@
+{
+  "name": "live-analysis-ai",
+  "version": "1.0.0",
+  "description": "Sistema automatizado para análise de lives usando IA",
+  "main": "analyze-segment.js",
+  "scripts": {
+    "analyze": "node analyze-segment.js",
+    "compile": "node compile-timeline.js",
+    "install-deps": "npm install && npx playwright install chromium",
+    "test": "node test-single-segment.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "ffmpeg-static": "^5.2.0"
+  },
+  "devDependencies": {},
+  "keywords": [
+    "live-analysis",
+    "ai",
+    "video-processing",
+    "automation",
+    "playwright"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
