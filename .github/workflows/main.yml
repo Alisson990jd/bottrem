@@ -8,24 +8,36 @@ on:
         description: 'URL da live para analisar'
         required: true
         type: string
-      duration_minutes:
-        description: 'Duração da live em minutos'
-        required: true
-        type: number
 
 jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
       segments: ${{ steps.generate-segments.outputs.segments }}
+      duration: ${{ steps.get-duration.outputs.duration }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install yt-dlp and ffmpeg
+        run: |
+          pip install yt-dlp
+          sudo apt update
+          sudo apt install -y ffmpeg
+
+      - name: Get video duration
+        id: get-duration
+        run: |
+          # Usar script JavaScript para melhor detecção
+          npm install
+          node get-video-duration.js "${{ github.event.inputs.video_url }}"
+          
       - name: Generate segment list
         id: generate-segments
         run: |
-          duration=${{ github.event.inputs.duration_minutes }}
+          duration=${{ steps.get-duration.outputs.duration }}
+          echo "📋 Gerando lista de $duration segmentos..."
+          
           segments="["
           for ((i=0; i<duration; i++)); do
             if [ $i -gt 0 ]; then
@@ -35,6 +47,7 @@ jobs:
           done
           segments="$segments]"
           echo "segments=$segments" >> $GITHUB_OUTPUT
+          echo "✅ Lista de segmentos gerada: $segments"
 
   analyze:
     runs-on: ubuntu-latest
@@ -62,19 +75,8 @@ jobs:
 
       - name: Download video segment
         run: |
-          # Instalar yt-dlp para baixar o segmento
-          pip install yt-dlp
-          
-          # Baixar segmento específico de 1 minuto
-          start_time=$((${{ matrix.segment }} * 60))
-          yt-dlp -f best --external-downloader ffmpeg --external-downloader-args "-ss $start_time -t 60" \
-            -o "segment_${{ matrix.segment }}.%(ext)s" \
-            "${{ github.event.inputs.video_url }}"
-          
-          # Converter para MP4 se necessário
-          if [ ! -f "segment_${{ matrix.segment }}.mp4" ]; then
-            ffmpeg -i segment_${{ matrix.segment }}.* -c copy segment_${{ matrix.segment }}.mp4
-          fi
+          # Usar script JavaScript para download otimizado
+          node download-segment.js "${{ github.event.inputs.video_url }}" ${{ matrix.segment }}
 
       - name: Analyze segment with AI
         run: node analyze-segment.js ${{ matrix.segment }} ${{ matrix.account_id }}
@@ -104,7 +106,7 @@ jobs:
           merge-multiple: true
 
       - name: Compile timeline
-        run: node compile-timeline.js ${{ github.event.inputs.duration_minutes }}
+        run: node compile-timeline.js ${{ needs.setup.outputs.duration }}
 
       - name: Upload final timeline
         uses: actions/upload-artifact@v4
