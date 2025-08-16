@@ -1,381 +1,115 @@
-name: Twitch Live Analyzer
+# .github/workflows/live-analysis.yml
+name: Live Analysis with AI
 
 on:
   workflow_dispatch:
     inputs:
-      twitch_url:
-        description: 'URL do VOD da Twitch'
+      video_url:
+        description: 'URL da live para analisar'
         required: true
-        default: 'https://www.twitch.tv/loud_coringa/v/2540240456?sr=a'
+        type: string
+      duration_minutes:
+        description: 'Duração da live em minutos'
+        required: true
+        type: number
 
 jobs:
-  analyze-twitch-live:
+  setup:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 horas
-    
+    outputs:
+      segments: ${{ steps.generate-segments.outputs.segments }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate segment list
+        id: generate-segments
+        run: |
+          duration=${{ github.event.inputs.duration_minutes }}
+          segments="["
+          for ((i=0; i<duration; i++)); do
+            if [ $i -gt 0 ]; then
+              segments="$segments,"
+            fi
+            segments="$segments$i"
+          done
+          segments="$segments]"
+          echo "segments=$segments" >> $GITHUB_OUTPUT
+
+  analyze:
+    runs-on: ubuntu-latest
+    needs: setup
     strategy:
       matrix:
+        segment: ${{ fromJson(needs.setup.outputs.segments) }}
         account_id: [0, 1, 2, 3, 4]
       max-parallel: 5
       fail-fast: false
     
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ffmpeg xvfb xsel xclip
-        
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install playwright asyncio yt-dlp
-        playwright install chromium
-        playwright install-deps
-        
-    - name: Setup accounts
-      id: setup_accounts
-      run: |
-        accounts=(
-          "timid-await-untidy@duck.com"
-          "fit-manmade-skater@duck.com" 
-          "rack-growl-gone@duck.com"
-          "blimp-diocese-race@duck.com"
-          "quail-scandal-lent@duck.com"
-        )
-        echo "email=${accounts[${{ matrix.account_id }}]}" >> $GITHUB_OUTPUT
-        echo "account_name=account_${{ matrix.account_id }}" >> $GITHUB_OUTPUT
-        
-    - name: Get video duration and calculate segments
-      id: video_info
-      run: |
-        # Obter duração total do vídeo
-        echo "Obtendo informações do vídeo..."
-        duration_seconds=$(yt-dlp --get-duration --no-warnings "${{ inputs.twitch_url }}" | head -1)
-        
-        # Converter para minutos (arredondar para cima)
-        if [[ $duration_seconds =~ ^[0-9]+$ ]]; then
-          total_minutes=$((duration_seconds / 60 + 1))
-        else
-          # Se não conseguir obter duração, tentar extrair com formato HH:MM:SS
-          if [[ $duration_seconds =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then
-            hours=${BASH_REMATCH[1]}
-            minutes=${BASH_REMATCH[2]}
-            seconds=${BASH_REMATCH[3]}
-            total_minutes=$((hours * 60 + minutes + (seconds > 0 ? 1 : 0)))
-          else
-            echo "ERRO: Não foi possível obter a duração do vídeo"
-            echo "Duração retornada: $duration_seconds"
-            exit 1
-          fi
-        fi
-        
-        echo "Duração total do vídeo: $total_minutes minutos"
-        
-        # Limitar para evitar timeout do GitHub Actions (máximo 6 horas = 360 minutos)
-        if [ $total_minutes -gt 360 ]; then
-          echo "AVISO: Vídeo muito longo ($total_minutes min). Limitando para 360 minutos (6h)."
-          total_minutes=360
-        fi
-        
-        echo "total_minutes=$total_minutes" >> $GITHUB_OUTPUT
-        echo "duration_seconds=$duration_seconds" >> $GITHUB_OUTPUT
-        
-    - name: Calculate segment range for this account
-      id: segments
-      run: |
-        total_minutes=${{ steps.video_info.outputs.total_minutes }}
-        
-        # Dividir segmentos entre as 5 contas
-        segments_per_account=$((total_minutes / 5))
-        remainder=$((total_minutes % 5))
-        
-        account_start=$((${{ matrix.account_id }} * segments_per_account))
-        
-        if [ ${{ matrix.account_id }} -lt $remainder ]; then
-          account_start=$((account_start + ${{ matrix.account_id }}))
-          segments_per_account=$((segments_per_account + 1))
-        else
-          account_start=$((account_start + remainder))
-        fi
-        
-        account_end=$((account_start + segments_per_account))
-        
-        echo "start=$account_start" >> $GITHUB_OUTPUT
-        echo "end=$account_end" >> $GITHUB_OUTPUT
-        echo "Conta ${{ matrix.account_id }}: segmentos $account_start até $((account_end-1)) de $total_minutes total"
-        
-    - name: Create directories
-      run: |
-        mkdir -p downloads
-        mkdir -p outputs
-        mkdir -p temp_videos
-        
-    - name: Start Xvfb
-      run: |
-        export DISPLAY=:99
-        Xvfb :99 -screen 0 1920x1080x24 &
-        sleep 3
-        
-    - name: Download and process video segments
-      env:
-        DISPLAY: :99
-      run: |
-        export DISPLAY=:99
-        
-        # Função para verificar espaço em disco
-        check_disk_space() {
-          available=$(df . | tail -1 | awk '{print $4}')
-          available_gb=$((available / 1024 / 1024))
-          echo "Espaço disponível: ${available_gb}GB"
-          
-          if [ $available_gb -lt 2 ]; then
-            echo "AVISO: Pouco espaço em disco! Limpando arquivos antigos..."
-            find temp_videos -name "*.mp4" -type f -delete 2>/dev/null || true
-          fi
-        }
-        
-        # Função para manter apenas 50 segmentos
-        manage_storage() {
-          segment_count=$(ls temp_videos/*.mp4 2>/dev/null | wc -l)
-          if [ $segment_count -gt 50 ]; then
-            echo "Muitos segmentos ($segment_count). Removendo os mais antigos..."
-            ls -t temp_videos/*.mp4 | tail -n +51 | xargs rm -f
-          fi
-        }
-        
-        # Função para capturar clipboard
-        get_clipboard_content() {
-          # Tentar diferentes métodos para pegar o clipboard
-          local content=""
-          
-          # Método 1: xclip
-          if command -v xclip >/dev/null 2>&1; then
-            content=$(timeout 5 xclip -selection clipboard -o 2>/dev/null || echo "")
-          fi
-          
-          # Método 2: xsel como fallback
-          if [ -z "$content" ] && command -v xsel >/dev/null 2>&1; then
-            content=$(timeout 5 xsel --clipboard --output 2>/dev/null || echo "")
-          fi
-          
-          echo "$content"
-        }
-        
-        email="${{ steps.setup_accounts.outputs.email }}"
-        account_name="${{ steps.setup_accounts.outputs.account_name }}"
-        start_seg=${{ steps.segments.outputs.start }}
-        end_seg=${{ steps.segments.outputs.end }}
-        
-        echo "Processando segmentos $start_seg até $((end_seg-1)) com $email"
-        
-        # Arquivo de saída específico para esta conta
-        output_file="outputs/${account_name}_analysis.txt"
-        total_minutes=${{ steps.video_info.outputs.total_minutes }}
-        
-        echo "=== ANÁLISE DA LIVE TWITCH ===" > $output_file
-        echo "Conta: $email" >> $output_file
-        echo "URL: ${{ inputs.twitch_url }}" >> $output_file
-        echo "Duração total: $total_minutes minutos" >> $output_file
-        echo "Segmentos desta conta: $start_seg até $((end_seg-1))" >> $output_file
-        echo "Data: $(date)" >> $output_file
-        echo "================================" >> $output_file
-        echo "" >> $output_file
-        
-        # Processar cada segmento
-        for ((segment=start_seg; segment<end_seg; segment++)); do
-          echo "=== Processando segmento $segment ==="
-          
-          # Verificar espaço e gerenciar storage
-          check_disk_space
-          manage_storage
-          
-          # Nome do arquivo do segmento
-          segment_file="temp_videos/segment_$(printf "%04d" $segment).mp4"
-          
-          # Download do segmento específico (1 minuto)
-          echo "Baixando segmento $segment..."
-          start_time=$((segment * 60))
-          
-          yt-dlp \
-            --external-downloader ffmpeg \
-            --external-downloader-args "ffmpeg:-ss $start_time -t 60" \
-            --format "best[height<=720]" \
-            --output "$segment_file" \
-            "${{ inputs.twitch_url }}" \
-            --no-playlist \
-            --no-warnings \
-            --quiet || {
-            echo "Erro ao baixar segmento $segment, pulando..."
-            continue
-          }
-          
-          # Verificar se o arquivo foi criado e tem tamanho razoável
-          if [ ! -f "$segment_file" ] || [ $(stat -f%z "$segment_file" 2>/dev/null || stat -c%s "$segment_file" 2>/dev/null || echo 0) -lt 100000 ]; then
-            echo "Segmento $segment inválido ou muito pequeno, pulando..."
-            rm -f "$segment_file"
-            continue
-          fi
-          
-          echo "Segmento $segment baixado: $(ls -lh $segment_file)"
-          
-          # Limpar clipboard antes de executar
-          echo "" | xclip -selection clipboard 2>/dev/null || true
-          echo "" | xsel --clipboard --input 2>/dev/null || true
-          
-          # Executar análise com IA
-          echo "Analisando segmento $segment com IA..."
-          
-          # Executar o script original do qwen.py
-          if python qwen.py -email "$email" -video "$segment_file"; then
-            echo "Script do qwen.py executado com sucesso para segmento $segment"
-            
-            # Aguardar um pouco para garantir que o clipboard foi preenchido
-            sleep 3
-            
-            # Tentar capturar o conteúdo do clipboard
-            response_text=$(get_clipboard_content)
-            
-            if [ -n "$response_text" ] && [ "$response_text" != "" ]; then
-              echo "Resposta capturada do clipboard para segmento $segment"
-              
-              # Adicionar ao arquivo principal
-              echo "=== SEGMENTO $(printf "%04d" $segment) ===" >> $output_file
-              echo "Arquivo: $(basename $segment_file)" >> $output_file
-              echo "Análise: $response_text" >> $output_file
-              echo "==================================================" >> $output_file
-              echo "" >> $output_file
-              
-              echo "Análise do segmento $segment salva com sucesso"
-            else
-              echo "AVISO: Clipboard vazio para segmento $segment"
-              
-              # Tentar esperar mais um pouco e tentar novamente
-              echo "Tentando capturar clipboard novamente..."
-              sleep 5
-              response_text=$(get_clipboard_content)
-              
-              if [ -n "$response_text" ] && [ "$response_text" != "" ]; then
-                echo "Resposta capturada na segunda tentativa para segmento $segment"
-                
-                echo "=== SEGMENTO $(printf "%04d" $segment) ===" >> $output_file
-                echo "Arquivo: $(basename $segment_file)" >> $output_file
-                echo "Análise: $response_text" >> $output_file
-                echo "==================================================" >> $output_file
-                echo "" >> $output_file
-              else
-                echo "ERRO: Não foi possível capturar a resposta para segmento $segment"
-                
-                echo "=== SEGMENTO $(printf "%04d" $segment) ===" >> $output_file
-                echo "Arquivo: $(basename $segment_file)" >> $output_file
-                echo "Análise: ERRO - Falha na captura da resposta (clipboard vazio)" >> $output_file
-                echo "==================================================" >> $output_file
-                echo "" >> $output_file
-              fi
-            fi
-          else
-            echo "ERRO: Falha na execução do qwen.py para segmento $segment"
-            echo "=== SEGMENTO $(printf "%04d" $segment) ===" >> $output_file
-            echo "Arquivo: $(basename $segment_file)" >> $output_file
-            echo "Análise: ERRO - Falha na execução do script de análise" >> $output_file
-            echo "==================================================" >> $output_file
-            echo "" >> $output_file
-          fi
-          
-          # Remover o arquivo de vídeo para economizar espaço
-          rm -f "$segment_file"
-          
-          echo "Segmento $segment processado e removido"
-          echo "---"
-          
-          # Pausa entre segmentos para evitar sobrecarga
-          sleep 10
-        done
-        
-        echo "=== Processamento da conta $account_name concluído ==="
-        
-    - name: Upload results
-      uses: actions/upload-artifact@v4
-      with:
-        name: analysis-results-${{ steps.setup_accounts.outputs.account_name }}
-        path: outputs/
-        retention-days: 30
-        
-    - name: Show final stats
-      run: |
-        account_name="${{ steps.setup_accounts.outputs.account_name }}"
-        output_file="outputs/${account_name}_analysis.txt"
-        
-        if [ -f "$output_file" ]; then
-          echo "=== ESTATÍSTICAS FINAIS ==="
-          echo "Arquivo: $output_file"
-          echo "Tamanho: $(ls -lh $output_file | awk '{print $5}')"
-          echo "Linhas: $(wc -l < $output_file)"
-          echo "Segmentos analisados: $(grep -c "=== SEGMENTO" $output_file || echo "0")"
-          
-          echo ""
-          echo "=== PRÉVIA DO CONTEÚDO ==="
-          head -20 "$output_file"
-          echo "..."
-          echo "(arquivo completo disponível nos artifacts)"
-        else
-          echo "ERRO: Arquivo de saída não encontrado!"
-        fi
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  combine-results:
-    needs: analyze-twitch-live
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: all_results/
-        
-    - name: Combine all analysis files
-      run: |
-        echo "=== ANÁLISE COMPLETA DA LIVE TWITCH ===" > final_analysis.txt
-        echo "URL: ${{ inputs.twitch_url }}" >> final_analysis.txt
-        echo "Análise completa da live inteira" >> final_analysis.txt
-        echo "Data de processamento: $(date)" >> final_analysis.txt
-        echo "=========================================" >> final_analysis.txt
-        echo "" >> final_analysis.txt
-        
-        # Combinar arquivos de todas as contas em ordem
-        for account_dir in all_results/analysis-results-account_*; do
-          if [ -d "$account_dir" ]; then
-            echo "Processando: $account_dir"
-            find "$account_dir" -name "*_analysis.txt" -exec cat {} \; >> final_analysis.txt
-            echo "" >> final_analysis.txt
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm install playwright ffmpeg-static
+          npx playwright install chromium
+
+      - name: Download video segment
+        run: |
+          # Instalar yt-dlp para baixar o segmento
+          pip install yt-dlp
+          
+          # Baixar segmento específico de 1 minuto
+          start_time=$((${{ matrix.segment }} * 60))
+          yt-dlp -f best --external-downloader ffmpeg --external-downloader-args "-ss $start_time -t 60" \
+            -o "segment_${{ matrix.segment }}.%(ext)s" \
+            "${{ github.event.inputs.video_url }}"
+          
+          # Converter para MP4 se necessário
+          if [ ! -f "segment_${{ matrix.segment }}.mp4" ]; then
+            ffmpeg -i segment_${{ matrix.segment }}.* -c copy segment_${{ matrix.segment }}.mp4
           fi
-        done
-        
-        # Estatísticas finais
-        echo ""
-        echo "=== ESTATÍSTICAS DA ANÁLISE COMPLETA ==="
-        echo "Arquivo final: final_analysis.txt"
-        echo "Tamanho total: $(ls -lh final_analysis.txt | awk '{print $5}')"
-        echo "Total de linhas: $(wc -l < final_analysis.txt)"
-        echo "Total de segmentos: $(grep -c "=== SEGMENTO" final_analysis.txt || echo "0")"
-        
-        # Mostrar início do arquivo
-        echo ""
-        echo "=== PRÉVIA DO RESULTADO FINAL ==="
-        head -50 final_analysis.txt
-        echo "..."
-        echo "(arquivo completo disponível nos artifacts)"
-        
-    - name: Upload combined results
-      uses: actions/upload-artifact@v4
-      with:
-        name: final-twitch-analysis
-        path: final_analysis.txt
-        retention-days: 90
+
+      - name: Analyze segment with AI
+        run: node analyze-segment.js ${{ matrix.segment }} ${{ matrix.account_id }}
+        env:
+          SEGMENT_FILE: segment_${{ matrix.segment }}.mp4
+
+      - name: Upload analysis result
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-segment-${{ matrix.segment }}
+          path: analysis_${{ matrix.segment }}.txt
+
+      - name: Clean up segment file
+        run: rm -f segment_${{ matrix.segment }}.*
+
+  compile-timeline:
+    runs-on: ubuntu-latest
+    needs: [setup, analyze]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all analysis results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: analysis-segment-*
+          merge-multiple: true
+
+      - name: Compile timeline
+        run: node compile-timeline.js ${{ github.event.inputs.duration_minutes }}
+
+      - name: Upload final timeline
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-timeline
+          path: |
+            timeline.txt
+            timeline.json
