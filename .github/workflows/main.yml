@@ -13,7 +13,7 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      segments: ${{ steps.generate-segments.outputs.segments }}
+      batches: ${{ steps.generate-batches.outputs.batches }}
       duration: ${{ steps.get-duration.outputs.duration }}
     steps:
       - name: Checkout repository
@@ -23,7 +23,7 @@ jobs:
         run: |
           pip install yt-dlp
           sudo apt update
-          sudo apt install -y ffmpeg
+          sudo apt install -y ffmpeg bc
 
       - name: Get video duration
         id: get-duration
@@ -32,31 +32,37 @@ jobs:
           npm install
           node get-video-duration.js "${{ github.event.inputs.video_url }}"
           
-      - name: Generate segment list
-        id: generate-segments
+      - name: Generate batches (max 250 segments per batch)
+        id: generate-batches
         run: |
           duration=${{ steps.get-duration.outputs.duration }}
-          echo "📋 Gerando lista de $duration segmentos..."
+          echo "📋 Gerando lotes para $duration segmentos..."
           
-          segments="["
-          for ((i=0; i<duration; i++)); do
-            if [ $i -gt 0 ]; then
-              segments="$segments,"
+          # Máximo de 250 segmentos por lote para ficar dentro do limite do GitHub
+          batch_size=250
+          total_batches=$(( (duration + batch_size - 1) / batch_size ))
+          
+          echo "📦 Total de lotes: $total_batches"
+          
+          batches="["
+          for ((batch=0; batch<total_batches; batch++)); do
+            if [ $batch -gt 0 ]; then
+              batches="$batches,"
             fi
-            segments="$segments$i"
+            batches="$batches$batch"
           done
-          segments="$segments]"
-          echo "segments=$segments" >> $GITHUB_OUTPUT
-          echo "✅ Lista de segmentos gerada: $segments"
+          batches="$batches]"
+          
+          echo "batches=$batches" >> $GITHUB_OUTPUT
+          echo "✅ Lotes gerados: $batches"
 
   analyze:
     runs-on: ubuntu-latest
     needs: setup
     strategy:
       matrix:
-        segment: ${{ fromJson(needs.setup.outputs.segments) }}
-        account_id: [0, 1, 2, 3, 4]
-      max-parallel: 5
+        batch: ${{ fromJson(needs.setup.outputs.batches) }}
+      max-parallel: 10
       fail-fast: false
     
     steps:
@@ -72,25 +78,84 @@ jobs:
         run: |
           npm install playwright ffmpeg-static
           npx playwright install chromium
+          pip install yt-dlp
+          sudo apt update
+          sudo apt install -y ffmpeg bc
 
-      - name: Download video segment
+      - name: Process batch segments
         run: |
-          # Usar script JavaScript para download otimizado
-          node download-segment.js "${{ github.event.inputs.video_url }}" ${{ matrix.segment }}
+          echo "🚀 Processando lote ${{ matrix.batch }}..."
+          
+          # Calcular range de segmentos para este lote
+          batch_size=250
+          batch_num=${{ matrix.batch }}
+          duration=${{ needs.setup.outputs.duration }}
+          
+          start_segment=$((batch_num * batch_size))
+          end_segment=$(((batch_num + 1) * batch_size - 1))
+          
+          # Não processar além da duração total
+          if [ $end_segment -ge $duration ]; then
+            end_segment=$((duration - 1))
+          fi
+          
+          echo "📊 Lote $batch_num: segmentos $start_segment a $end_segment"
+          
+          # Array para armazenar PIDs dos processos paralelos
+          pids=()
+          account_id=0
+          
+          # Processar segmentos em paralelo (5 por vez)
+          for ((segment=start_segment; segment<=end_segment; segment++)); do
+            # Aguardar se já temos 5 processos rodando
+            if [ ${#pids[@]} -ge 5 ]; then
+              wait ${pids[0]}
+              pids=("${pids[@]:1}")
+            fi
+            
+            echo "📥 Iniciando segmento $segment com conta $account_id..."
+            
+            # Download do segmento
+            node download-segment.js "${{ github.event.inputs.video_url }}" $segment &
+            download_pid=$!
+            
+            # Aguardar download terminar
+            wait $download_pid
+            
+            # Se download foi bem-sucedido, analisar
+            if [ -f "segment_${segment}.mp4" ]; then
+              node analyze-segment.js $segment $account_id &
+              pids+=($!)
+            else
+              echo "❌ Segmento $segment falhou no download, pulando análise..."
+              # Criar arquivo de erro
+              echo "ERRO: Download do segmento $segment falhou" > "analysis_${segment}.txt"
+            fi
+            
+            # Rotacionar conta (0-4)
+            account_id=$(((account_id + 1) % 5))
+          done
+          
+          # Aguardar todos os processos terminarem
+          for pid in "${pids[@]}"; do
+            wait $pid
+          done
+          
+          echo "✅ Lote ${{ matrix.batch }} processado!"
 
-      - name: Analyze segment with AI
-        run: node analyze-segment.js ${{ matrix.segment }} ${{ matrix.account_id }}
-        env:
-          SEGMENT_FILE: segment_${{ matrix.segment }}.mp4
-
-      - name: Upload analysis result
+      - name: Upload batch results
         uses: actions/upload-artifact@v4
         with:
-          name: analysis-segment-${{ matrix.segment }}
-          path: analysis_${{ matrix.segment }}.txt
+          name: batch-${{ matrix.batch }}-results
+          path: |
+            analysis_*.txt
+            segment_*_info.json
 
-      - name: Clean up segment file
-        run: rm -f segment_${{ matrix.segment }}.*
+      - name: Clean up segments
+        run: |
+          echo "🧹 Limpando arquivos temporários..."
+          rm -f segment_*.mp4
+          rm -f segment_*_info.json
 
   compile-timeline:
     runs-on: ubuntu-latest
@@ -99,19 +164,50 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download all analysis results
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download all batch results
         uses: actions/download-artifact@v4
         with:
-          pattern: analysis-segment-*
+          pattern: batch-*-results
           merge-multiple: true
 
       - name: Compile timeline
         run: node compile-timeline.js ${{ needs.setup.outputs.duration }}
 
+      - name: Create processing summary
+        run: |
+          echo "📊 RESUMO DO PROCESSAMENTO" > processing_summary.txt
+          echo "=========================" >> processing_summary.txt
+          echo "URL da live: ${{ github.event.inputs.video_url }}" >> processing_summary.txt
+          echo "Duração total: ${{ needs.setup.outputs.duration }} minutos" >> processing_summary.txt
+          echo "Processado em: $(date)" >> processing_summary.txt
+          echo "" >> processing_summary.txt
+          
+          # Contar arquivos processados
+          total_files=$(ls analysis_*.txt 2>/dev/null | wc -l)
+          echo "Arquivos de análise encontrados: $total_files" >> processing_summary.txt
+          
+          # Contar sucessos e falhas
+          success_count=$(grep -l "ANÁLISE:" analysis_*.txt 2>/dev/null | wc -l)
+          error_count=$(grep -l "ERRO:" analysis_*.txt 2>/dev/null | wc -l)
+          
+          echo "Análises bem-sucedidas: $success_count" >> processing_summary.txt
+          echo "Análises com erro: $error_count" >> processing_summary.txt
+          
+          if [ $total_files -gt 0 ]; then
+            success_rate=$(echo "scale=1; $success_count * 100 / $total_files" | bc)
+            echo "Taxa de sucesso: ${success_rate}%" >> processing_summary.txt
+          fi
+
       - name: Upload final timeline
         uses: actions/upload-artifact@v4
         with:
-          name: live-timeline
+          name: live-timeline-complete
           path: |
             timeline.txt
             timeline.json
+            processing_summary.txt
